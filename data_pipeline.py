@@ -17,8 +17,10 @@ def clean_text(text: str) -> str:
     Returns:
         str: Cleaned and normalized text string.
     """
-    # TODO: Strip unwanted markup, non-ASCII noise, and normalize spaces/newlines.
-    raise NotImplementedError("Implement this method")
+    text = re.sub(r"(?:https?://|www\.)[^\s<>\"']+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"[^\x00-\x7F]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def quality_filter(
@@ -39,8 +41,19 @@ def quality_filter(
     Returns:
         bool: True if the document meets quality criteria, False otherwise.
     """
+    words = text.split()
+    if len(words)<min_words:
+        return False
+
+    caps_ratio = sum(word.isupper() for word in words) / len(words)
+    if caps_ratio > max_ratio_caps:
+        return False
+
+    special_count = sum(not ch.isalnum() and not ch.isspace() for ch in text)
+    special_ratio = special_count / len(text) if text else 0.0
+    return special_ratio <= max_ratio_special
     # TODO: Check word count thresholds and measure capitalization and special-character ratios.
-    raise NotImplementedError("Implement this method")
+    # raise NotImplementedError("Implement this method")
 
 
 def get_shingles(text: str, k: int = 5) -> Set[str]:
@@ -54,8 +67,12 @@ def get_shingles(text: str, k: int = 5) -> Set[str]:
     Returns:
         Set[str]: Unique set of k-word shingles.
     """
+    if k<=0:
+        raise ValueError("k must be positive")
+    words = re.findall(r"\b\w+\b", text.lower())
+    return {" ".join(words[i:i+k]) for i in range(len(words)- k + 1)}
     # TODO: Lowercase, tokenize into words, and construct word n-gram shingles.
-    raise NotImplementedError("Implement this method")
+    # raise NotImplementedError("Implement this method")
 
 
 def minhash_signature(shingles: Set[str], num_hashes: int = 128) -> List[int]:
@@ -69,9 +86,28 @@ def minhash_signature(shingles: Set[str], num_hashes: int = 128) -> List[int]:
     Returns:
         List[int]: MinHash signature list of length (num_hashes,).
     """
-    # TODO: Generate hash permutations for each seed and compute the minimum hash value per seed.
-    raise NotImplementedError("Implement this method")
+    if num_hashes<0:
+        raise ValueError("num_hashes must be nonnegetive")
+    if not shingles:
+        return [0]*num_hashes
 
+    signature = []
+    encoded_shingles = [shingle.encode("utf-8") for shingle in shingles]
+    for seed in range(num_hashes):
+        prefix = seed.to_bytes(8, byteorder="big")
+        minimum = min(
+            int.from_bytes(hashlib.sha256(prefix+shingle).digest()[:8], "big")
+            for shingle in encoded_shingles
+        )
+        signature.append(minimum)
+    return signature
+    # TODO: Generate hash permutations for each seed and compute the minimum hash value per seed.
+    # raise NotImplementedError("Implement this method")
+
+
+# shingles = {"the cat", "cat is", "is cute"}
+# signature = minhash_signature(shingles, num_hashes=4)
+# print(signature)
 
 def lsh_buckets(signature: List[int], bands: int = 16) -> List[Tuple[int, str]]:
     """
@@ -84,9 +120,23 @@ def lsh_buckets(signature: List[int], bands: int = 16) -> List[Tuple[int, str]]:
     Returns:
         List[Tuple[int, str]]: List of (band_id, bucket_hash) tuples of length (bands,).
     """
-    # TODO: Slice signature into bands, hash each band chunk, and map to bucket identifiers.
-    raise NotImplementedError("Implement this method")
+    if bands <= 0:
+            raise ValueError("bands must be a positive integer")
+    if len(signature) < bands:
+        raise ValueError("signature must contain at least one value per band")
 
+    buckets = []
+    for band_id in range(bands):
+        start = band_id * len(signature) // bands
+        end = (band_id + 1) * len(signature) // bands
+        chunk = signature[start:end]
+        chunk_bytes = ",".join(str(value) for value in chunk).encode("ascii")
+        buckets.append((band_id, hashlib.sha256(chunk_bytes).hexdigest()))
+    return buckets
+    # TODO: Slice signature into bands, hash each band chunk, and map to bucket identifiers.
+    # raise NotImplementedError("Implement this method")
+
+# buckets = lsh_buckets(signature, bands=2)
 
 def deduplicate(
     documents: List[str], 
@@ -106,10 +156,51 @@ def deduplicate(
     Returns:
         Tuple[List[str], int]: Tuple containing (list of deduplicated documents, count of removed duplicates).
     """
+    if not 0 <= threshold <= 1:
+        raise ValueError("Threshold must be between 0 and 1")
+    if num_hashes < bands or bands <= 0:
+        raise ValueError("num_hashes must be >= bands > 0")
+    if len(documents) < 2:
+        return list(documents), 0
+
+    shingle_sets = [get_shingles(document, k=5) for document in documents]
+    signatures = [minhash_signature(shingle, num_hashes) for shingle in shingle_sets]
+
+    buckets = defaultdict(list)
+    for doc_id, signature in enumerate(signatures):
+        for bucket in lsh_buckets(signature, bands):
+            buckets[bucket].append(doc_id)
+
+    candidate_pairs = set()
+    for indices in buckets.values():
+        for position, left in enumerate(indices):
+            for right in indices[position + 1:]:
+                candidate_pairs.add((left, right))  
+
+    removed = set()
+    # Keep the earliest occurrence of each duplicate, retaining original order.
+    for left, right in sorted(candidate_pairs):
+        if left in removed or right in removed:
+            continue
+        union = shingle_sets[left] | shingle_sets[right]
+        similarity = (len(shingle_sets[left] & shingle_sets[right]) / len(union)
+                      if union else float(documents[left] == documents[right]))
+        if similarity >= threshold:
+            removed.add(right)
+
+    deduplicated = [doc for i, doc in enumerate(documents) if i not in removed]
+    return deduplicated, len(removed)
+
     # TODO: Build MinHash signatures and map documents into LSH band buckets.
     # TODO: Collect candidate pairs from shared buckets, verify Jaccard similarity, and prune duplicates.
-    raise NotImplementedError("Implement this method")
+    # raise NotImplementedError("Implement this method")
 
+# documents = [
+#     "machine learning is useful for artificial intelligence",
+#     "machine learning is useful for artificial intelligence",
+#     "computer vision works with digital images"
+# ]
+# print(deduplicate(documents)[0])
 
 class SimpleTokenizer:
     """
