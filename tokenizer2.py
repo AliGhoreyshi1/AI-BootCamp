@@ -2,6 +2,7 @@ import re
 import unicodedata
 from collections import Counter
 from typing import Dict, List, Tuple, Union
+from tokenizer1 import BPETokenizer
 
 try:
     import regex
@@ -13,7 +14,6 @@ except ImportError:
         r"""'(?:[sdmt]|ll|ve|re)| ?[a-zA-Z]+| ?[0-9]+| ?[^\s\w]+|\s+(?!\S)|\s+"""
     )
 
-
 def pre_tokenize(text: str) -> List[str]:
     """
     Split input text into initial word/symbol chunks using the GPT-2 regex pattern.
@@ -24,17 +24,7 @@ def pre_tokenize(text: str) -> List[str]:
     Returns:
         List[str]: A list of string chunks matched by the pre-tokenization regex.
     """
-    # TODO: Apply GPT2_PATTERN regex iterator over text to extract all chunk string matches
-    # matches = GPT2_PATTERN.finditer(text)
-    # chunks = []
-    # for match in matches:
-    #     chunks.append(match.group())
-
-    # return chunks
-
     return [match.group() for match in GPT2_PATTERN.finditer(text)]
-    
-
 
 def apply_merge(byte_seq: List[int], pair: Tuple[int, int], new_id: int) -> List[int]:
     """
@@ -48,23 +38,16 @@ def apply_merge(byte_seq: List[int], pair: Tuple[int, int], new_id: int) -> List
     Returns:
         List[int]: A new list of token IDs with target pairs merged.
     """
-    # TODO: Iterate through byte_seq, find adjacent matching pairs, and replace them with new_id
     result = []
-
     i = 0
-
     while i < len(byte_seq):
-        if (i + 1 < len(byte_seq) 
-        and  byte_seq[i] == pair[0] 
-        and byte_seq[i + 1] == pair[1]
-            ):
+        if i + 1 < len(byte_seq) and (byte_seq[i], byte_seq[i + 1]) == pair:
             result.append(new_id)
             i += 2
         else:
             result.append(byte_seq[i])
             i += 1
-
-    return result 
+    return result
 
 class SpecialTokenHandler:
     """
@@ -87,20 +70,9 @@ class SpecialTokenHandler:
         Returns:
             None
         """
-        # TODO: Store the token ID mapping and update the compiled regex pattern using re.escape
         self.special_tokens[token_str] = token_id
-
-        # for test 
-        dict_keys = []
-        # for key in self.special_tokens.keys():
-        #     dict_keys.append(re.escape(key))
-
-        pattern = '|'.join(re.escape(key) for key in self.special_tokens.keys())
-        self.pattern = re.compile(pattern)
-        
-            
-
-        
+        ordered = sorted(self.special_tokens, key=len, reverse=True)
+        self.pattern = re.compile("|".join(re.escape(k) for k in ordered))
 
     def split_with_specials(self, text: str) -> List[Tuple[str, bool]]:
         """
@@ -112,45 +84,31 @@ class SpecialTokenHandler:
         Returns:
             List[Tuple[str, bool]]: A list of tuples where each tuple is (substring, is_special_flag).
         """
-        # TODO: Search text using pattern, split into standard text vs special token parts, and tag each part
-        
-
-        result = []
-
         if self.pattern is None:
-            result.append((text , False))
-            return result
+            return [(text, False)] if text else []
 
-        matches = self.pattern.finditer(text)
+        result: List[Tuple[str, bool]] = []
         last_end = 0
-
-        for match in matches:
-            normal_text = text[last_end :match.start()]
-
-            if normal_text:
-                result.append((normal_text , False))
-            
-            result.append((match.group() , True))
+        for match in self.pattern.finditer(text):
+            if match.start() > last_end:
+                result.append((text[last_end:match.start()], False))
+            result.append((match.group(), True))
             last_end = match.end()
 
-        remaining = text[last_end :]
-        if remaining:
-            result.append((remaining , False))
-
+        if last_end < len(text):
+            result.append((text[last_end:], False))
         return result
 
-
-
-class ProductionTokenizer:
+class ProductionTokenizer(BPETokenizer):
     """
     Byte-Pair Encoding (BPE) tokenizer supporting training, normalization, special tokens, encoding, and decoding.
     """
 
     def __init__(self) -> None:
         """Initialize vocabulary, merges, special token handler, and next available token ID."""
-        self.merges: Dict[Tuple[int, int], int] = {}
+        super().__init__()
         self.vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-        self.special_handler: SpecialTokenHandler = SpecialTokenHandler()
+        self.special_handler = SpecialTokenHandler()
         self.next_id: int = 256
 
     def normalize(self, text: str) -> str:
@@ -163,9 +121,19 @@ class ProductionTokenizer:
         Returns:
             str: Unicode normalized string.
         """
-        # TODO: Normalize input text using unicodedata NFKC standard
         return unicodedata.normalize('NFKC' , text)
 
+    def _to_byte_chunks(self, text: str) -> List[List[int]]:
+        """Pre-tokenize plain text and convert each chunk to a list of byte values.
+
+        Args:
+            text (str): Text without special tokens.
+
+        Returns:
+            List[List[int]]: One byte sequence per chunk.
+        """
+        return [list(chunk.encode("utf-8")) for chunk in pre_tokenize(text)]
+    
     def train(self, text: str, num_merges: int) -> None:
         """
         Train the BPE tokenizer by identifying frequent adjacent pairs and iteratively merging them.
@@ -177,40 +145,26 @@ class ProductionTokenizer:
         Returns:
             None
         """
-        # TODO: Normalize and pre-tokenize corpus text into byte sequences
-        # TODO: Iteratively count adjacent pair frequencies across all chunk byte sequences
-        # TODO: Find the most frequent pair, create a new vocabulary entry, and record the merge rule
-        # TODO: Replace the best pair in all chunk sequences using apply_merge
+        if self.merges:
+            raise RuntimeError("train() can only be called once on a fresh tokenizer.")
+        
         text = self.normalize(text)
-        chunks = pre_tokenize(text)
         byte_chunks = []
-        for chunk in chunks:
-            byte_chunks.append(list(chunk.encode('utf-8')))
+        for part, is_special in self.special_handler.split_with_specials(text):
+            if not is_special:
+                byte_chunks.extend(self._to_byte_chunks(part))
 
         for _ in range(num_merges):
-            pair_counts = {}
-
-            for byte_seq in byte_chunks:
-                for i in range(len(byte_seq) - 1):
-                    pair = (byte_seq[i] , byte_seq[i+1])
-                    if pair in pair_counts:
-                        pair_counts[pair] += 1
-                    else:
-                        pair_counts[pair] = 1
-
+            pair_counts = Counter(p for seq in byte_chunks for p in zip(seq, seq[1:]))
             if not pair_counts:
                 break
-            best_pair = max(pair_counts , key=lambda x: pair_counts[x])
+            best_pair, _ = pair_counts.most_common(1)[0]
 
-            next_id = self.next_id
+            new_id = self.next_id
             self.next_id += 1
-            self.merges[best_pair] = next_id
-            self.vocab[next_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
-
-            for i , byte_seq in enumerate(byte_chunks):
-                byte_chunks[i] = apply_merge(byte_seq , best_pair , next_id)
-
-
+            self.merges[best_pair] = new_id
+            self.vocab[new_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
+            byte_chunks = [self._merge_pair(seq, best_pair, new_id) for seq in byte_chunks]
 
     def add_special_token(self, token_str: str) -> int:
         """
@@ -222,15 +176,12 @@ class ProductionTokenizer:
         Returns:
             int: Assigned vocabulary integer ID for the special token.
         """
-        # TODO: Allocate new_id, register special token with special_handler and add byte representation to vocab
         new_id = self.next_id
         self.next_id += 1
-        self.special_handler.add_token(token_str , new_id)
-        self.vocab[new_id] = token_str.encode('utf-8')
-
+        self.special_handler.add_token(token_str, new_id)
+        self.vocab[new_id] = token_str.encode("utf-8")
         return new_id
 
-    
     def encode(self, text: str) -> List[int]:
         """
         Encode raw text into a sequence of vocabulary token IDs using trained merges and special tokens.
@@ -241,30 +192,17 @@ class ProductionTokenizer:
         Returns:
             List[int]: List of encoded vocabulary token IDs.
         """
-        # TODO: Normalize input text and split into standard text and special token segments
-        # TODO: For standard text segments, apply pre-tokenization and convert chunks into byte sequences
-        # TODO: Apply learned BPE merges sequentially to byte sequences and collect all output token IDs
         text = self.normalize(text)
-        parts = self.special_handler.split_with_specials(text)
-        ids = []
-
-        for part , is_special in parts:
+        ids: List[int] = []
+        for part, is_special in self.special_handler.split_with_specials(text):
             if is_special:
                 ids.append(self.special_handler.special_tokens[part])
-            else:
-                chunks = pre_tokenize(part)
-                byte_chunks = []
-                for chunk in chunks:
-                    byte_chunks.append(list(chunk.encode('utf-8')))
-                for best_pair , new_id in self.merges.items():
-                    for i , byte_seq in enumerate(byte_chunks):
-                        byte_chunks[i] = apply_merge(byte_seq , best_pair , new_id)
-
-                for byte_seq in byte_chunks:
-                    ids.extend(byte_seq)
-
+                continue
+            for seq in self._to_byte_chunks(part):
+                for pair, new_id in self.merges.items():
+                    seq = self._merge_pair(seq, pair, new_id)
+                ids.extend(seq)
         return ids
-            
 
     def decode(self, ids: List[int]) -> str:
         """
@@ -276,19 +214,7 @@ class ProductionTokenizer:
         Returns:
             str: Decoded UTF-8 text string.
         """
-        # TODO: Map token IDs back to byte representations using vocabulary and decode as UTF-8
-        decoded = b''.join(self.get_token_bytes(token_id) for token_id in ids)
-        return decoded.decode('utf-8')
-
-    def vocab_size(self) -> int:
-        """
-        Get current total size of vocabulary including base bytes, merges, and special tokens.
-
-        Returns:
-            int: Number of total entries in vocabulary.
-        """
-        # TODO: Return total number of vocabulary items
-        return len(self.vocab)
+        return b"".join(self.get_token_bytes(i) for i in ids).decode("utf-8", errors="replace")
 
     def get_token_bytes(self, token_id: int) -> bytes:
         """
@@ -300,9 +226,10 @@ class ProductionTokenizer:
         Returns:
             bytes: Byte sequence corresponding to token_id, or default placeholder if not found.
         """
-        # TODO: Retrieve byte mapping from vocabulary dictionary for specified token_id
-        return self.vocab.get(token_id , b"?")
-
+        try:
+            return self.vocab[token_id]
+        except KeyError as e:
+            raise KeyError(f"Unknown token id: {token_id}") from e
 
 # [KEEP_IMPLEMENTATION]
 def demo_byte_encoding() -> None:
@@ -461,8 +388,6 @@ def demo_tiktoken_comparison() -> None:
 
 
 # ===== UNIT TESTS =====
-
-
 def test_pre_tokenize() -> None:
     """Test pre_tokenize output structure and edge cases."""
     res = pre_tokenize("Hello world! 123")
@@ -541,22 +466,13 @@ def test_production_tokenizer_encode_decode() -> None:
 
 
 if __name__ == "__main__":
-    # demo_byte_encoding()
-    # demo_pre_tokenization()
-    # demo_full_tokenizer()
-    # demo_tiktoken_comparison()
-    
     test_pre_tokenize()
-    print("test_pre_tokenize PASSED")
-
     test_apply_merge()
-    print("test_apply_merge PASSED")
-
     test_special_token_handler()
-    print("test_special_token_handler PASSED")
-
     test_production_tokenizer_train()
-    print("test_production_tokenizer_train PASSED")
-
     test_production_tokenizer_encode_decode()
-    print("test_production_tokenizer_encode_decode PASSED")
+
+    demo_byte_encoding()
+    demo_pre_tokenization()
+    demo_full_tokenizer()
+    demo_tiktoken_comparison()
