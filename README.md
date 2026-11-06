@@ -8,9 +8,9 @@ A hands-on implementation of core language-modeling components, built with Pytho
 
 AI-BootCamp is organized around three connected areas:
 
-1. **Tokenization** – character-level and Byte Pair Encoding (BPE) tokenizers, including a byte-level tokenizer with pre-tokenization and special-token support.
-2. **Dataset preparation** – cleaning and normalizing text, filtering low-quality documents, detecting dominant scripts/languages, removing personally identifiable information (PII), detecting near-duplicates, and packing token sequences for language-model training.
-3. **MiniGPT** – a small GPT-like autoregressive Transformer implemented in PyTorch, with causal self-attention, training and validation loops, text generation, and checkpointing.
+1. **Tokenization**: character-level and Byte Pair Encoding (BPE) tokenizers, including a byte-level tokenizer with pre-tokenization and special-token support.
+2. **Dataset preparation**: cleaning and normalizing text, filtering low-quality documents, detecting dominant scripts/languages, removing personally identifiable information (PII), detecting near-duplicates, and packing token sequences for language-model training.
+3. **MiniGPT**: a small GPT-like autoregressive Transformer implemented in PyTorch, with causal self-attention, dropout, training and validation loops, early stopping, text generation, and checkpointing.
 
 The included CSV contains Persian-language comments associated with doctors. The training pipeline groups short comments by doctor to create longer documents before preparing them for pre-training.
 
@@ -25,13 +25,13 @@ The included CSV contains Persian-language comments associated with doctors. The
 
 ### Data pipeline
 
-- Persian normalization using Hazm, including normalization of Arabic/Persian character variants and spacing.
-- Removal of HTML tags and URLs, followed by whitespace cleanup.
+- Persian normalization using Hazm, including normalization of Arabic/Persian character variants, zero-width non-joiner (ZWNJ) handling, diacritic removal, and spacing around punctuation. Digits are kept as they are.
+- Removal of HTML tags and URLs, followed by normalization and whitespace cleanup.
 - Quality filtering based on document length, uppercase-word ratio, and special-character ratio.
 - Script/language heuristics for filtering documents by dominant language.
 - Near-duplicate detection using word shingles, MinHash signatures, Locality-Sensitive Hashing (LSH), and Jaccard similarity.
 - PII-pattern removal and repetitive-text filtering.
-- Grouping short doctor comments into longer documents.
+- Grouping short doctor comments into longer documents. Comments are normalized before exact-duplicate removal, so spelling variants of the same comment are removed as well.
 - BPE training, tokenization, sequence packing, document-aware labels and IDs, train/validation splitting, and batch loading.
 - Dataset statistics such as token counts, vocabulary utilization, compression ratio, and sequence utilization.
 
@@ -40,9 +40,10 @@ The included CSV contains Persian-language comments associated with doctors. The
 - Custom token and positional embeddings.
 - Custom Layer Normalization implementation.
 - Causal multi-head self-attention and feed-forward blocks.
+- Dropout on embeddings, attention weights, and sub-layer outputs.
 - Residual Transformer blocks and autoregressive next-token prediction.
 - Padding/document-boundary-aware loss masking and document-aware attention.
-- AdamW optimization, validation-loss tracking, early stopping, and best-checkpoint saving.
+- AdamW optimization with weight decay on weight matrices only, validation-loss tracking, early stopping, and best-checkpoint saving.
 - Temperature-based autoregressive text generation.
 - Automatic CUDA selection when a CUDA-enabled PyTorch installation and compatible GPU are available; otherwise, CPU is used.
 
@@ -64,15 +65,14 @@ AI-BootCamp/
 - PyTorch.
 - Hazm.
 - `regex` (recommended; `tokenizer2.py` includes a standard-library `re` fallback).
+- `pytest` (only needed to run the unit tests).
 - `tiktoken` is optional and is only needed for the tokenizer comparison demonstrations.
 
-Install the core dependencies:
+Create and activate a virtual environment:
 
 ```bash
 python -m venv .venv
 ```
-
-Activate the environment:
 
 ```bash
 # Windows PowerShell
@@ -86,7 +86,7 @@ Install packages:
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install torch hazm regex
+python -m pip install torch hazm regex pytest
 ```
 
 For GPU training, install the PyTorch build that matches your CUDA environment. Follow the official selector at <https://pytorch.org/get-started/locally/> rather than assuming that a generic PyPI installation will enable CUDA.
@@ -133,7 +133,7 @@ Available command-line options:
 | Option | Description | Default |
 |---|---|---:|
 | `--csv` | Path to the input CSV file | `comments_raw_canonical.csv` |
-| `--docs` | Maximum number of grouped documents to sample; omit to use all | All |
+| `--docs` | Maximum number of grouped documents to use; omit to use all | All |
 | `--merges` | Number of BPE merge operations | `300` |
 | `--steps` | Maximum optimizer steps | `3000` |
 | `--dropout` | Model dropout probability | `0.1` |
@@ -147,7 +147,28 @@ To use a CSV stored elsewhere:
 python mini_gpt_torch.py --only-pipeline --csv path/to/comments_raw_canonical.csv
 ```
 
-The training function saves the best model weights to `best_mini_gpt.pt` by default. The checkpoint contains the model state dictionary; keep the tokenizer configuration/merge rules alongside it if you plan to reproduce text generation later.
+### Training, early stopping and checkpoints
+
+The validation loss is measured every 100 steps. The model with the lowest validation loss is kept, and it is saved to `best_mini_gpt.pt` in the working directory each time it improves. Training stops early when the validation loss has not improved for `--patience` consecutive checks, and the best weights are restored before the model is returned.
+
+The checkpoint file contains only the model's state dictionary. It does **not** contain the tokenizer. The tokenizer is rebuilt by the data pipeline each time it runs, using the fixed seed and the same `--docs`, `--merges`, and CSV file. The repository does not yet include a function that loads a saved checkpoint for generation, so generating text from `best_mini_gpt.pt` requires writing that loader and rebuilding the tokenizer with the same settings.
+
+### Example training run
+
+The following run used the default settings on the full doctor-comments dataset (`--only-pipeline`, all documents, `--steps 3000`, `--dropout 0.1`, `--patience 5`):
+
+| Item | Value |
+|---|---|
+| Documents | 6,739 |
+| Tokens | 998,525 |
+| Vocabulary | 558 |
+| Blocks (length 128) | 7,021 train / 780 validation |
+| Validation loss, step 100 | 4.92 |
+| Validation loss, step 1,000 | 3.57 |
+| Validation loss, step 2,000 | 3.20 |
+| Validation loss, step 3,000 | 3.02 |
+
+Validation loss was still decreasing at the last check, so early stopping did not trigger and the run ended at the step limit. Train and validation losses stayed close to each other, which suggests the model was not yet overfitting at this size. Increasing `--steps` is the first thing to try. The generated Persian text is more coherent than in earlier runs on the smaller 300-document subset.
 
 ### Run tokenizer demonstrations
 
@@ -156,7 +177,7 @@ python tokenizer1.py
 python tokenizer2.py
 ```
 
-These scripts run their built-in tests and demonstrations. The `tokenizer1.py` comparison with `tiktoken` is skipped when that optional package is not installed.
+These scripts run their demonstrations. The `tokenizer1.py` comparison with `tiktoken` is skipped when that optional package is not installed.
 
 ### Run the standalone data-pipeline demonstration
 
@@ -164,7 +185,7 @@ These scripts run their built-in tests and demonstrations. The `tokenizer1.py` c
 python data_pipeline.py
 ```
 
-This runs the pipeline's built-in sample-corpus demonstration and its assertions. The doctor-comments CSV training workflow is launched through `mini_gpt_torch.py` as shown above.
+This runs the pipeline on a built-in sample corpus and prints statistics. It does not run the unit tests; see [Tests](#tests) below. The doctor-comments training workflow is launched through `mini_gpt_torch.py` as shown above.
 
 ## Dataset format
 
@@ -181,7 +202,7 @@ The provided `comments_raw_canonical.csv` uses the following columns:
 | `label` | Label included in the source dataset |
 | `date` | Comment date |
 
-The current document-building function reads `text` and `doctor_id`. It normalizes comments, removes exact duplicates within each doctor, joins comments until a document reaches the configured minimum word count, shuffles the resulting documents with a seed, and optionally samples a maximum number of documents.
+The document-building function reads `text` and `doctor_id`. It normalizes comments, removes exact duplicates within each doctor, joins comments until a document reaches the configured minimum word count, shuffles the resulting documents with a seed, and optionally samples a maximum number of documents.
 
 ## High-level training workflow
 
@@ -192,7 +213,7 @@ CSV comments
 Group comments by doctor and build longer documents
     │
     ▼
-Normalize and clean text
+Normalize and clean text (HTML/URL removal, hazm normalization)
     │
     ▼
 Filter low-quality / unsupported / repetitive content
@@ -210,10 +231,10 @@ Pack token IDs with document IDs, labels and masks
 Create training and validation blocks
     │
     ▼
-Train MiniGPT with causal attention and next-token loss
+Train MiniGPT with dropout, causal attention and next-token loss
     │
     ▼
-Save best checkpoint and generate sample text
+Early stopping, best-checkpoint saving and sample generation
 ```
 
 ## Notes and limitations
@@ -223,22 +244,20 @@ Save best checkpoint and generate sample text
 - PII removal is pattern-based and cannot guarantee that all identifying information is removed. Review data handling carefully before sharing or using the dataset.
 - The included data appears to contain user comments about healthcare providers. Confirm that you have the necessary rights and permissions to use or redistribute it. Do not publish private, identifying, or otherwise restricted data in a public repository.
 - GPU acceleration requires a compatible NVIDIA driver, CUDA-enabled PyTorch build, and supported hardware. The code falls back to CPU if CUDA is unavailable.
+- The checkpoint does not include the tokenizer, and no checkpoint-loading function is provided yet (see [Training, early stopping and checkpoints](#training-early-stopping-and-checkpoints)).
 - The training script's default run includes a small built-in demonstration before the CSV workflow. Use `--only-pipeline` to skip that first demonstration.
 
 ## Tests
 
-The tokenizer scripts execute their built-in test functions when run directly:
+The unit tests use `pytest`. Run them from the project root:
 
 ```bash
-python tokenizer1.py
-python tokenizer2.py
+python -m pytest -q tokenizer1.py tokenizer2.py data_pipeline.py
 ```
 
-The data-pipeline script also runs its assertions when executed:
+At the time of writing, these run 26 tests across the three files, and all of them pass.
 
-```bash
-python data_pipeline.py
-```
+Running `python data_pipeline.py` or `python tokenizer1.py` does not replace this step: those commands run demonstrations, not the test functions.
 
 ## License
 
@@ -246,4 +265,4 @@ No license file was included with the supplied project files. Add a `LICENSE` fi
 
 ---
 
-**AI-BootCamp** — learning how tokenizers, data pipelines, and Transformer language models fit together.
+**AI-BootCamp**: learning how tokenizers, data pipelines, and Transformer language models fit together.
