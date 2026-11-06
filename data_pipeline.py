@@ -1,17 +1,42 @@
 import re
+import csv
 import hashlib
 import random
 import time
 from collections import Counter, defaultdict
 from typing import Iterable, List, Tuple, Set, Dict, Any, Generator, Optional
 from tokenizer2 import ProductionTokenizer
+from hazm import Normalizer
+
+# Persian normalizer from hazm. persian_numbers=False keeps digits as they are, so
+# the number handling in remove_pii() and _PERSIAN_DIGITS still sees the original text.
+_HAZM_NORMALIZER = Normalizer(persian_numbers=False)
+
+
+def normalize_text(text: str) -> str:
+    """
+    Persian text normalization with hazm.
+
+    Converts Arabic yeh/kaf to Persian ی/ک, removes tatweel and diacritics,
+    fixes spacing around punctuation and affixes, and standardizes the zero-width
+    non-joiner (ZWNJ). Digits are left unchanged.
+
+    Args:
+        text (str): Input text.
+
+    Returns:
+        str: Normalized text.
+    """
+    return _HAZM_NORMALIZER.normalize(text)
+
 
 def clean_text(text: str) -> str:
     """
-    Cleans raw document text by stripping HTML tags and URLs, and normalizing whitespace.
+    Cleans raw document text: strips URLs and HTML tags, normalizes Persian text with
+    hazm, and collapses whitespace.
 
-    Non-ASCII characters are kept on purpose: the pipeline is multilingual, and
-    Unicode normalization (NFKC) is applied by the tokenizer, not here.
+    Order matters: URLs and tags are removed first so that hazm only sees visible text.
+    Unicode NFKC normalization is still applied by the tokenizer on top of this.
 
     Args:
         text (str): Input raw text document.
@@ -21,6 +46,7 @@ def clean_text(text: str) -> str:
     """
     text = re.sub(r"(?:https?://|www\.)[^\s<>\"']+", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]*>", " ", text)
+    text = normalize_text(text)
     return re.sub(r"\s+", " ", text).strip()
 
 def quality_filter(
@@ -204,7 +230,7 @@ def deduplicate(
             continue
         union = shingle_sets[left] | shingle_sets[right]
         similarity = (len(shingle_sets[left] & shingle_sets[right]) / len(union)
-                      if union else float(documents[left] == documents[right]))
+                    if union else float(documents[left] == documents[right]))
         if similarity >= threshold:
             removed.add(right)
 
@@ -730,6 +756,133 @@ def compute_statistics(
         "top_tokens": Counter(token_ids).most_common(10),
     }
 
+# ---------------------------------------------------------------------------
+# Doctor-comments corpus (used by mini_gpt_torch.py)
+# ---------------------------------------------------------------------------
+
+# Arabic letter variants that appear in user-typed Persian text; NFKC does not unify them.
+_TRAILING_PUNCT = " .,\u060c;\u061b:!?\u061f-_~"
+
+
+def comments_to_documents(
+    csv_path: str,
+    text_column: str = "text",
+    group_column: str = "doctor_id",
+    min_words: int = 60,
+    max_documents: Optional[int] = None,
+    seed: int = 0,
+) -> List[str]:
+    """
+    Turn a CSV of short comments into pre-training documents that the pipeline can accept.
+
+    Doctor comments are tiny (median ~4 words) while quality_filter() requires 50+ words,
+    so comments are first de-duplicated (exact match after normalization) and then
+    concatenated, per doctor and in file order, into documents of at least `min_words` words.
+    A leftover tail shorter than `min_words` is dropped.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        text_column (str): Column that holds the comment text.
+        group_column (str): Column used to keep comments of the same author together.
+        min_words (int): A document is closed as soon as it has this many words.
+        max_documents (Optional[int]): If set, keep a random sample of this many documents
+            (sampled across all doctors, not just the first ones in the file).
+        seed (int): Seed for the sampling/shuffling.
+
+    Returns:
+        List[str]: Shuffled list of documents. Comments inside a document are separated by ". ".
+    """
+    by_group: Dict[str, List[str]] = defaultdict(list)
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            # clean_text() normalizes with hazm before the exact-duplicate check below,
+            # so comments that differ only in spelling variants or ZWNJ count as duplicates.
+            text = clean_text(row.get(text_column) or "")
+            text = text.strip(_TRAILING_PUNCT)
+            if text:
+                by_group[row.get(group_column, "")].append(text)
+
+    documents: List[str] = []
+    for comments in by_group.values():
+        seen: Set[str] = set()
+        parts: List[str] = []
+        word_count = 0
+        for comment in comments:
+            if comment in seen:
+                continue
+            seen.add(comment)
+            parts.append(comment)
+            word_count += len(comment.split())
+            if word_count >= min_words:
+                documents.append(". ".join(parts) + ".")
+                parts, word_count = [], 0
+
+    random.Random(seed).shuffle(documents)
+    if max_documents is not None:
+        documents = documents[:max_documents]
+    return documents
+
+
+def split_packed(
+    packed: Dict[str, List[List[int]]], val_fraction: float = 0.1
+) -> Tuple[Dict[str, List[List[int]]], Dict[str, List[List[int]]]]:
+    """
+    Split packed blocks (output of pack_documents) into a train part and a validation part.
+
+    Documents are already shuffled by comments_to_documents(), so the last blocks are used
+    for validation.
+
+    Args:
+        packed (Dict[str, List[List[int]]]): Dict with equally long lists per key.
+        val_fraction (float): Fraction of blocks reserved for validation (at least one block).
+
+    Returns:
+        Tuple[dict, dict]: (train_blocks, val_blocks) with the same keys as `packed`.
+    """
+    num_blocks = len(next(iter(packed.values())))
+    if num_blocks < 2:
+        raise ValueError("need at least 2 blocks to split")
+    num_val = min(num_blocks - 1, max(1, int(num_blocks * val_fraction)))
+    cut = num_blocks - num_val
+    train = {k: v[:cut] for k, v in packed.items()}
+    val = {k: v[cut:] for k, v in packed.items()}
+    return train, val
+
+
+class PackedBlockLoader(PreTrainingDataLoader):
+    """
+    PreTrainingDataLoader that also serves labels and doc_ids from pack_documents().
+
+    Shuffling, epochs and rank/world_size sharding are inherited from PreTrainingDataLoader;
+    only __iter__ differs: it yields a dict of lists instead of an (inputs, masks) tuple.
+    """
+
+    def __init__(
+        self,
+        packed: Dict[str, List[List[int]]],
+        batch_size: int,
+        shuffle: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+    ):
+        super().__init__(packed["input_ids"], packed["attention_mask"], batch_size,
+                         shuffle=shuffle, rank=rank, world_size=world_size, seed=seed)
+        self.labels = packed["labels"]
+        self.doc_ids = packed["doc_ids"]
+
+    def __iter__(self) -> Generator[Dict[str, List[List[int]]], None, None]:
+        indices = self._indices()
+        for start in range(0, len(indices), self.batch_size):
+            batch = indices[start:start + self.batch_size]
+            yield {
+                "input_ids": [self.sequences[i] for i in batch],
+                "labels": [self.labels[i] for i in batch],
+                "doc_ids": [self.doc_ids[i] for i in batch],
+                "attention_mask": [self.attention_masks[i] for i in batch],
+            }
+
+
 # [KEEP_IMPLEMENTATION]
 def generate_sample_corpus() -> List[str]:
     """
@@ -930,6 +1083,41 @@ def test_clean_text():
     
     # Edge case: Empty input string
     assert clean_text("") == "", "Edge case failed: Empty string must return an empty string."
+
+
+def test_normalize_text():
+    # Arabic yeh and kaf are mapped to Persian forms
+    assert normalize_text("دكتر خوب") == "دکتر خوب", "Arabic kaf/yeh were not converted."
+    assert normalize_text("كتاب") == "کتاب", "Arabic kaf was not converted."
+    # Tatweel is removed
+    assert "\u0640" not in normalize_text("خــوب"), "Tatweel was not removed."
+    # ZWNJ is kept inside words
+    assert "\u200c" in normalize_text("کتاب\u200cها"), "ZWNJ inside a word was lost."
+    # Digits are not converted
+    assert normalize_text("12") == "12", "Digits must stay unchanged."
+    # Edge case: Empty input string
+    assert normalize_text("") == "", "Edge case failed: Empty string must return an empty string."
+
+
+def test_clean_text_persian():
+    # HTML is removed before hazm runs, and the result is normalized
+    assert clean_text("<p>دكتر   خوب</p>") == "دکتر خوب", "Persian HTML text was not cleaned and normalized."
+
+
+def test_comments_dedup_after_normalization():
+    import os
+    import tempfile
+
+    rows = "doctor_id,text\n1,دكتر خوب بود\n1,دکتر خوب بود\n1,دکتر   خوب بود\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".csv", delete=False) as f:
+        f.write(rows)
+        path = f.name
+    try:
+        docs = comments_to_documents(path, min_words=1)
+    finally:
+        os.remove(path)
+    assert len(docs) == 1, "Spelling variants of the same comment were not de-duplicated."
+    assert docs[0].count("دکتر خوب بود") == 1, "The duplicate comment appears more than once."
 
 def test_quality_filter():
     good_text = " ".join(["word"] * 60)
